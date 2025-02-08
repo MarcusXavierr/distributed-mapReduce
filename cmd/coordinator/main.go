@@ -2,50 +2,79 @@
 package main
 
 import (
-	"fmt"
+	"bufio"
+	"flag"
 	"io"
 	"os"
-	"strings"
+	"path/filepath"
 	"time"
 
 	"github.com/MarcusXavierr/distributed-mapReduce/pkg/mr"
+	"go.uber.org/zap"
 )
 
 func main() {
-	filenames := parseArgs()
+	var reducers int
+	flag.IntVar(&reducers, "reducers", 1, "Number of reducers")
+	flag.Parse()
+	filenames := parseArgs(reducers)
 
-	m := mr.MakeCoordinator(filenames, 10)
-	<-m.Ctx.Done()
-	fmt.Println("Done!")
+	zapLogger, _ := configLogger().Build()
+	defer zapLogger.Sync()
+	zap.ReplaceGlobals(zapLogger)
+
+	m := mr.MakeCoordinator(filenames, reducers)
+	for m.Done() == false {
+		time.Sleep(time.Second)
+	}
+	zap.S().Info("Coordinator finished")
 }
 
-func parseArgs() (filenames []string) {
-	if len(os.Args) >= 2 {
+func parseArgs(reducers int) (filenames []string) {
+	if len(os.Args) >= 2 && reducers == 1 {
 		filenames = os.Args[1:]
 		return
 	}
 
 	c := make(chan []string)
 	go func() {
-		buf, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
-			os.Exit(1)
+		files := []string{}
+		stream := bufio.NewReader(os.Stdin)
+		for {
+			b, err := stream.ReadBytes('\n')
+			if err == io.EOF {
+				break
+			}
+
+			if err != nil {
+				zap.S().Fatal("Error reading stdin", "error", err)
+			}
+
+			if len(b) > 0 {
+				files = append(files, string(b))
+			}
 		}
-		if len(buf) == 0 {
-			// INFO: this causes a deadlock, but it's not a problem because the
-			// program will exit anyway
-			return
-		}
-		str := strings.Split(string(buf), "\n")
-		c <- str[:len(str)-1]
+		c <- files
 	}()
 
 	select {
 	case filenames = <-c:
-	case <-time.After(time.Millisecond * 300):
-		fmt.Fprintf(os.Stderr, "Usage: coordinator inputfiles...\n")
-		os.Exit(1)
+	case <-time.After(time.Millisecond * 2000):
+		zap.S().Fatal("Usage: coordinator inputfiles...")
 	}
 	return
+}
+
+func configLogger() zap.Config {
+	logDir := "/tmp/mapreducerlogs"
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		panic(err)
+	}
+	config := zap.NewProductionConfig()
+	config.OutputPaths = []string{
+		"stdout",
+		filepath.Join(logDir, "coordinator_"+time.Now().Format("2006-01-02")+".log"),
+	}
+	config.Encoding = "console"
+	return config
 }
